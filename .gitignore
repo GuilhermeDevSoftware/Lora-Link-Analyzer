@@ -1,0 +1,9 @@
+
+**/target/
+**/build/
+**/managed_components/
+**/sdkconfig.old
+**/.venv/
+**/__pycache__/
+*.pyc
+*.zip
