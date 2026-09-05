@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdbool.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -62,6 +64,13 @@
 static const char *TAG = "LORA_RX";
 
 static spi_device_handle_t lora_spi;
+static bool sequence_initialized = false;
+
+static uint32_t last_sequence = 0;
+static uint32_t total_received = 0;
+static uint32_t total_lost = 0;
+static uint32_t total_duplicates = 0;
+static uint32_t total_out_of_order = 0;
 
 static void sx1278_gpio_init(void)
 {
@@ -364,6 +373,167 @@ static void sx1278_configure_receiver(void)
     ESP_LOGI(TAG, "Receptor LoRa iniciado");
 }
 
+static bool parse_packet_sequence(
+    const uint8_t *payload,
+    uint8_t length,
+    uint32_t *sequence
+)
+{
+    /*
+     * Formato esperado:
+     * SEQ=00001;MSG=STM32-LORA
+     */
+    if (length < 10)
+    {
+        return false;
+    }
+
+    if (memcmp(payload, "SEQ=", 4) != 0)
+    {
+        return false;
+    }
+
+    if (payload[9] != ';')
+    {
+        return false;
+    }
+
+    uint32_t value = 0;
+
+    for (uint8_t index = 4; index < 9; index++)
+    {
+        if (payload[index] < '0' ||
+            payload[index] > '9')
+        {
+            return false;
+        }
+
+        value =
+            (value * 10) +
+            (payload[index] - '0');
+    }
+
+    *sequence = value;
+
+    return true;
+}
+
+static void reset_link_metrics(void)
+{
+    sequence_initialized = false;
+    last_sequence = 0;
+    total_received = 0;
+    total_lost = 0;
+    total_duplicates = 0;
+    total_out_of_order = 0;
+}
+
+static void update_link_metrics(uint32_t sequence)
+{
+    /*
+     * Se a STM32 reiniciar, a sequência volta para 1.
+     * Nesse caso iniciamos uma nova sessão.
+     */
+    if (sequence_initialized &&
+        sequence == 1 &&
+        last_sequence > 1)
+    {
+        ESP_LOGW(
+            TAG,
+            "Nova sessao detectada"
+        );
+
+        reset_link_metrics();
+    }
+
+    if (!sequence_initialized)
+    {
+        sequence_initialized = true;
+        last_sequence = sequence;
+        total_received = 1;
+    }
+    else if (sequence == last_sequence)
+    {
+        total_duplicates++;
+    }
+    else if (sequence > last_sequence)
+    {
+        uint32_t difference =
+            sequence - last_sequence;
+
+        if (difference > 1)
+        {
+            uint32_t lost_now =
+                difference - 1;
+
+            total_lost += lost_now;
+
+            ESP_LOGW(
+                TAG,
+                "Perda detectada: %" PRIu32
+                " pacote(s)",
+                lost_now
+            );
+        }
+
+        total_received++;
+        last_sequence = sequence;
+    }
+    else
+    {
+        total_out_of_order++;
+    }
+
+    uint32_t total_expected =
+        total_received + total_lost;
+
+    float delivery_rate = 0.0f;
+
+    if (total_expected > 0)
+    {
+        delivery_rate =
+            ((float)total_received /
+             (float)total_expected) *
+            100.0f;
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Sequencia atual: %" PRIu32,
+        sequence
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Pacotes recebidos: %" PRIu32,
+        total_received
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Pacotes perdidos: %" PRIu32,
+        total_lost
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Pacotes duplicados: %" PRIu32,
+        total_duplicates
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Fora de ordem: %" PRIu32,
+        total_out_of_order
+    );
+
+    ESP_LOGI(
+        TAG,
+        "Taxa de entrega: %.2f%%",
+        (double)delivery_rate
+    );
+}
+
 static void sx1278_receive_packet(void)
 {
     uint8_t irq_flags =
@@ -458,6 +628,23 @@ static void sx1278_receive_packet(void)
         "Tamanho: %u bytes",
         packet_length
     );
+
+    uint32_t sequence = 0;
+
+    if (parse_packet_sequence(
+        payload,
+        packet_length,
+        &sequence))
+    {
+    update_link_metrics(sequence);
+    }
+    else
+    {
+    ESP_LOGW(
+        TAG,
+        "Formato de pacote desconhecido"
+    );
+    }
 
     ESP_LOGI(
         TAG,

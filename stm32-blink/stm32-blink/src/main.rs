@@ -44,7 +44,34 @@ const MODE_LORA_TX: u8 = 0x8B;
 
 const SX127X_EXPECTED_VERSION: u8 = 0x12;
 
-const MESSAGE: &[u8] = b"STM32-LORA TESTE 1";
+const PACKET_LENGTH: usize = 24;
+
+const PACKET_TEMPLATE: &[u8; PACKET_LENGTH] = b"SEQ=00000;MSG=STM32-LORA";
+
+fn build_packet(sequence: u32) -> [u8; PACKET_LENGTH] {
+    let mut packet = *PACKET_TEMPLATE;
+
+    /*
+     * Mantém somente cinco dígitos:
+     * 1     -> 00001
+     * 42    -> 00042
+     * 12345 -> 12345
+     */
+    let mut value = sequence % 100_000;
+
+    /*
+     * Os dígitos ficam entre os índices 4 e 8:
+     *
+     * SEQ=00000;MSG=STM32-LORA
+     *     ^^^^^
+     */
+    for index in (4..9).rev() {
+        packet[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    packet
+}
 
 #[entry]
 fn main() -> ! {
@@ -237,17 +264,19 @@ fn main() -> ! {
          * Primeiro byte da transferência é o endereço do FIFO.
          * Os demais bytes são a mensagem.
          */
-        let mut fifo_data = [0_u8; MESSAGE.len() + 1];
+        let packet = build_packet(packet_number);
+
+        let mut fifo_data = [0_u8; PACKET_LENGTH + 1];
 
         fifo_data[0] = REG_FIFO | 0x80;
-        fifo_data[1..].copy_from_slice(MESSAGE);
+        fifo_data[1..].copy_from_slice(&packet);
 
         let _ = cs.set_low();
         let fifo_ok = spi.transfer_in_place(&mut fifo_data).is_ok();
         let _ = cs.set_high();
 
         // Informa ao rádio o tamanho da mensagem
-        write_register!(REG_PAYLOAD_LENGTH, MESSAGE.len() as u8);
+        write_register!(REG_PAYLOAD_LENGTH, PACKET_LENGTH as u8);
 
         // Limpa as interrupções antes de transmitir
         write_register!(REG_IRQ_FLAGS, 0xFF);
