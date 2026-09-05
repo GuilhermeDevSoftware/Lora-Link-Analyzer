@@ -12,32 +12,53 @@ use stm32f4xx_hal::{
     spi::{Mode, Phase, Polarity, Spi},
 };
 
-// Timestamp simples para as mensagens do defmt.
-// Ainda não precisamos medir o tempo real.
 defmt::timestamp!("{=u32}", 0_u32);
 
-// Registrador que identifica a versão do SX1278.
+// Registradores principais do SX1278
+const REG_FIFO: u8 = 0x00;
+const REG_OP_MODE: u8 = 0x01;
+const REG_FRF_MSB: u8 = 0x06;
+const REG_FRF_MID: u8 = 0x07;
+const REG_FRF_LSB: u8 = 0x08;
+const REG_PA_CONFIG: u8 = 0x09;
+const REG_FIFO_ADDR_PTR: u8 = 0x0D;
+const REG_FIFO_TX_BASE_ADDR: u8 = 0x0E;
+const REG_IRQ_FLAGS: u8 = 0x12;
+const REG_MODEM_CONFIG_1: u8 = 0x1D;
+const REG_MODEM_CONFIG_2: u8 = 0x1E;
+const REG_PREAMBLE_MSB: u8 = 0x20;
+const REG_PREAMBLE_LSB: u8 = 0x21;
+const REG_PAYLOAD_LENGTH: u8 = 0x22;
+const REG_MODEM_CONFIG_3: u8 = 0x26;
+const REG_SYNC_WORD: u8 = 0x39;
+const REG_DIO_MAPPING_1: u8 = 0x40;
 const REG_VERSION: u8 = 0x42;
 
-// Valor esperado para a família SX1276/77/78/79.
+// Bits do registrador RegIrqFlags
+const IRQ_TX_DONE: u8 = 0x08;
+
+// Modos do SX1278 para frequência abaixo de 525 MHz
+const MODE_LORA_SLEEP: u8 = 0x88;
+const MODE_LORA_STANDBY: u8 = 0x89;
+const MODE_LORA_TX: u8 = 0x8B;
+
 const SX127X_EXPECTED_VERSION: u8 = 0x12;
+
+const MESSAGE: &[u8] = b"STM32-LORA TESTE 1";
 
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
     let cp = cortex_m::Peripherals::take().unwrap();
 
-    // Utiliza o clock interno HSI.
     let mut rcc = dp.RCC.freeze(Config::DEFAULT);
 
-    // Separa os bancos de GPIO utilizados.
     let gpioa = dp.GPIOA.split(&mut rcc);
     let gpiob = dp.GPIOB.split(&mut rcc);
     let gpioc = dp.GPIOC.split(&mut rcc);
 
     /*
      * SPI1:
-     *
      * PA5 = D13 = SCK
      * PA6 = D12 = MISO
      * PA7 = D11 = MOSI
@@ -48,49 +69,30 @@ fn main() -> ! {
 
     /*
      * Controle do SX1278:
-     *
-     * PB6 = D10 = NSS/CS
-     * PC7 = D9  = RESET
+     * PB6  = D10 = NSS
+     * PC7  = D9  = RESET
+     * PA10 = D2  = DIO0
      */
     let mut cs = gpiob.pb6.into_push_pull_output();
     let mut reset = gpioc.pc7.into_push_pull_output();
+    let dio0 = gpioa.pa10.into_pull_down_input();
 
-    // Temporizador baseado no SysTick do Cortex-M4.
     let mut delay = Delay::new(cp.SYST, rcc.clocks.hclk().raw());
 
-    /*
-     * O SX1278 só aceita comandos SPI quando NSS/CS está baixo.
-     * Fora de uma transferência, mantemos o pino em nível alto.
-     */
     let _ = cs.set_high();
 
-    /*
-     * Reset físico do SX1278.
-     *
-     * RESET baixo  -> rádio em reset
-     * RESET alto   -> funcionamento normal
-     */
+    // Reset físico do SX1278
     let _ = reset.set_low();
     delay.delay_ms(10_u32);
 
     let _ = reset.set_high();
     delay.delay_ms(20_u32);
 
-    /*
-     * SPI modo 0:
-     *
-     * CPOL = 0: clock permanece baixo quando ocioso.
-     * CPHA = 0: dados capturados na primeira transição.
-     */
     let spi_mode = Mode {
         polarity: Polarity::IdleLow,
         phase: Phase::CaptureOnFirstTransition,
     };
 
-    /*
-     * Configura o SPI1 em 500 kHz.
-     * A frequência baixa facilita o primeiro teste da montagem.
-     */
     let mut spi = Spi::new(
         dp.SPI1,
         (Some(sck), Some(miso), Some(mosi)),
@@ -100,88 +102,194 @@ fn main() -> ! {
     );
 
     /*
-     * Leitura do RegVersion:
-     *
-     * bit 7 do endereço = 0 -> operação de leitura
-     * endereço 0x42     -> RegVersion
-     *
-     * Durante o primeiro byte, enviamos o endereço.
-     * Durante o segundo byte, recebemos o valor do registrador.
+     * Macro para escrever em um registrador.
+     * O bit 7 do endereço deve ser 1 para escrita.
      */
-    let mut buffer = [REG_VERSION & 0x7F, 0x00];
+    macro_rules! write_register {
+        ($register:expr, $value:expr) => {{
+            let mut data = [$register | 0x80, $value];
 
-    let _ = cs.set_low();
+            let _ = cs.set_low();
+            let success = spi.transfer_in_place(&mut data).is_ok();
+            let _ = cs.set_high();
 
-    let transfer_ok = spi.transfer_in_place(&mut buffer).is_ok();
-
-    let _ = cs.set_high();
-
-    // O primeiro byte recebido é descartado.
-    let version = buffer[1];
-
-    let radio_detectado =
-        transfer_ok && version == SX127X_EXPECTED_VERSION;
+            success
+        }};
+    }
 
     /*
-     * PA5 também está conectado ao LED verde LD2 da Nucleo.
-     *
-     * Depois da leitura, liberamos o SPI e recuperamos o PA5
-     * para indicar visualmente o resultado.
+     * Macro para ler um registrador.
+     * O bit 7 do endereço deve ser 0 para leitura.
      */
-    let (_spi1, (sck, _miso, _mosi)) = spi.release();
+    macro_rules! read_register {
+        ($register:expr) => {{
+            let mut data = [$register & 0x7F, 0x00];
 
-    let mut led = match sck.unwrap() {
-        stm32f4xx_hal::gpio::alt::spi1::Sck::PA5(pin) => {
-            pin.into_push_pull_output()
+            let _ = cs.set_low();
+            let success = spi.transfer_in_place(&mut data).is_ok();
+            let _ = cs.set_high();
+
+            (success, data[1])
+        }};
+    }
+
+    // Confirma novamente a comunicação SPI
+    let (transfer_ok, version) = read_register!(REG_VERSION);
+
+    defmt::info!("Transferencia SPI concluida: {=bool}", transfer_ok);
+
+    defmt::info!("RegVersion: {=u8}", version);
+
+    if !transfer_ok || version != SX127X_EXPECTED_VERSION {
+        loop {
+            defmt::error!("SX1278 nao detectado. RegVersion: {=u8}", version);
+
+            delay.delay_ms(2000_u32);
         }
-        _ => unreachable!(),
-    };
+    }
 
-    let _ = led.set_low();
+    defmt::info!("SX1278 detectado com sucesso");
+
+    /*
+     * Coloca o rádio em modo LoRa Sleep.
+     *
+     * Bit 7 = LoRa
+     * Bit 3 = Low Frequency Mode, necessário para 433 MHz
+     * Bits 2:0 = Sleep
+     */
+    write_register!(REG_OP_MODE, MODE_LORA_SLEEP);
+    delay.delay_ms(10_u32);
+
+    /*
+     * Frequência de 433 MHz.
+     *
+     * FRF = 433 MHz × 2^19 / 32 MHz
+     * Resultado: 0x6C4000
+     */
+    write_register!(REG_FRF_MSB, 0x6C);
+    write_register!(REG_FRF_MID, 0x40);
+    write_register!(REG_FRF_LSB, 0x00);
+
+    /*
+     * Potência aproximada de 12 dBm usando PA_BOOST.
+     * É suficiente para o primeiro teste em bancada.
+     */
+    write_register!(REG_PA_CONFIG, 0x8A);
+
+    /*
+     * ModemConfig1:
+     * Bandwidth = 125 kHz
+     * Coding Rate = 4/5
+     * Header explícito
+     */
+    write_register!(REG_MODEM_CONFIG_1, 0x72);
+
+    /*
+     * ModemConfig2:
+     * Spreading Factor = SF7
+     * CRC ativado
+     */
+    write_register!(REG_MODEM_CONFIG_2, 0x74);
+
+    /*
+     * ModemConfig3:
+     * Low Data Rate Optimize desativado
+     * AGC automático ativado
+     */
+    write_register!(REG_MODEM_CONFIG_3, 0x04);
+
+    // Preâmbulo de 8 símbolos
+    write_register!(REG_PREAMBLE_MSB, 0x00);
+    write_register!(REG_PREAMBLE_LSB, 0x08);
+
+    // Sync Word da rede LoRa privada
+    write_register!(REG_SYNC_WORD, 0x12);
+
+    /*
+     * DIO0 = TxDone.
+     * Bits 7:6 = 01.
+     */
+    write_register!(REG_DIO_MAPPING_1, 0x40);
+
+    // Início da região de transmissão do FIFO
+    write_register!(REG_FIFO_TX_BASE_ADDR, 0x00);
+
+    // Limpa todas as interrupções anteriores
+    write_register!(REG_IRQ_FLAGS, 0xFF);
+
+    // Coloca o rádio em Standby
+    write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+    delay.delay_ms(10_u32);
+
+    defmt::info!("SX1278 configurado em 433 MHz");
+    defmt::info!("Iniciando transmissoes");
+
+    let mut packet_number: u32 = 1;
 
     loop {
+        // Retorna ao modo Standby antes de preparar o pacote
+        write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+
+        // Aponta o FIFO para o início da área de transmissão
+        write_register!(REG_FIFO_ADDR_PTR, 0x00);
+
         /*
-         * As mensagens são repetidas porque as primeiras mensagens RTT
-         * podem acontecer antes de o probe-rs começar a monitorá-las.
+         * Primeiro byte da transferência é o endereço do FIFO.
+         * Os demais bytes são a mensagem.
          */
-        defmt::info!(
-            "Transferencia SPI concluida: {=bool}",
-            transfer_ok
-        );
+        let mut fifo_data = [0_u8; MESSAGE.len() + 1];
 
-        defmt::info!(
-            "RegVersion em decimal: {=u8}",
-            version
-        );
+        fifo_data[0] = REG_FIFO | 0x80;
+        fifo_data[1..].copy_from_slice(MESSAGE);
 
-        defmt::info!(
-            "Valor esperado em decimal: 18"
-        );
+        let _ = cs.set_low();
+        let fifo_ok = spi.transfer_in_place(&mut fifo_data).is_ok();
+        let _ = cs.set_high();
 
-        if radio_detectado {
-            /*
-             * Sucesso:
-             * uma piscada longa seguida de uma pausa.
-             */
-            let _ = led.set_high();
-            delay.delay_ms(500_u32);
+        // Informa ao rádio o tamanho da mensagem
+        write_register!(REG_PAYLOAD_LENGTH, MESSAGE.len() as u8);
 
-            let _ = led.set_low();
-            delay.delay_ms(1500_u32);
-        } else {
-            /*
-             * Falha:
-             * três piscadas rápidas seguidas de uma pausa.
-             */
-            for _ in 0..3 {
-                let _ = led.set_high();
-                delay.delay_ms(100_u32);
+        // Limpa as interrupções antes de transmitir
+        write_register!(REG_IRQ_FLAGS, 0xFF);
 
-                let _ = led.set_low();
-                delay.delay_ms(100_u32);
-            }
+        defmt::info!("Transmitindo pacote: {=u32}", packet_number);
 
-            delay.delay_ms(1400_u32);
+        defmt::info!("FIFO preenchido: {=bool}", fifo_ok);
+
+        // Inicia a transmissão
+        write_register!(REG_OP_MODE, MODE_LORA_TX);
+
+        /*
+         * Aguarda DIO0 ficar alto.
+         * Existe um timeout de 2 segundos para evitar travamento.
+         */
+        let mut timeout_ms: u32 = 0;
+
+        while dio0.is_low() && timeout_ms < 2000 {
+            delay.delay_ms(1_u32);
+            timeout_ms += 1;
         }
+
+        // Também verifica o TxDone diretamente no registrador
+        let (irq_read_ok, irq_flags) = read_register!(REG_IRQ_FLAGS);
+
+        let tx_done = irq_read_ok && (irq_flags & IRQ_TX_DONE) != 0;
+
+        if tx_done {
+            defmt::info!("TxDone confirmado. Pacote: {=u32}", packet_number);
+        } else {
+            defmt::warn!("TxDone nao confirmado. IRQ flags: {=u8}", irq_flags);
+        }
+
+        // Limpa TxDone e outras interrupções
+        write_register!(REG_IRQ_FLAGS, 0xFF);
+
+        // Retorna para Standby
+        write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+
+        packet_number = packet_number.wrapping_add(1);
+
+        // Um novo pacote a cada dois segundos
+        delay.delay_ms(2000_u32);
     }
 }
