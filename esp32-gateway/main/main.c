@@ -3,42 +3,43 @@
 #include <string.h>
 #include <stdbool.h>
 #include <inttypes.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-
 #include "esp_err.h"
 #include "esp_log.h"
 
-/*
- * Pinagem ESP32 ↔ SX1278
- */
 #define LORA_PIN_MISO 19
 #define LORA_PIN_MOSI 23
-#define LORA_PIN_SCK  18
-#define LORA_PIN_NSS  5
-#define LORA_PIN_RST  14
+#define LORA_PIN_SCK 18
+#define LORA_PIN_NSS 5
+#define LORA_PIN_RST 14
 #define LORA_PIN_DIO0 26
-
-/*
- * Registradores do SX1278
- */
-#define REG_FIFO                 0x00
-#define REG_OP_MODE              0x01
-#define REG_FRF_MSB              0x06
-#define REG_FRF_MID              0x07
-#define REG_FRF_LSB              0x08
-#define REG_LNA                  0x0C
-#define REG_FIFO_ADDR_PTR        0x0D
-#define REG_FIFO_RX_BASE_ADDR    0x0F
+#define REG_FIFO 0x00
+#define REG_OP_MODE 0x01
+#define REG_FRF_MSB 0x06
+#define REG_FRF_MID 0x07
+#define REG_FRF_LSB 0x08
+#define REG_PA_CONFIG 0x09
+#define REG_LNA 0x0C
+#define REG_FIFO_ADDR_PTR 0x0D
+#define REG_FIFO_TX_BASE_ADDR 0x0E
+#define REG_FIFO_RX_BASE_ADDR 0x0F
 #define REG_FIFO_RX_CURRENT_ADDR 0x10
-#define REG_IRQ_FLAGS            0x12
-#define REG_RX_NB_BYTES          0x13
-#define REG_PKT_SNR_VALUE        0x19
-#define REG_PKT_RSSI_VALUE       0x1A
+#define REG_IRQ_FLAGS 0x12
+#define REG_RX_NB_BYTES 0x13
+#define REG_PKT_SNR_VALUE 0x19
+#define REG_PKT_RSSI_VALUE 0x1A
+#define REG_HOP_CHANNEL 0x1C
+#define REG_PAYLOAD_LENGTH 0x22
+#define IRQ_TX_DONE 0x08
+#define MODE_LORA_TX 0x8B
+
+// Margem para o STM32 alternar de TX para RX, antes do ACK.
+#define ACK_TURNAROUND_MS 50
+#define ACK_TX_TIMEOUT_MS 1000
+
 #define REG_MODEM_CONFIG_1       0x1D
 #define REG_MODEM_CONFIG_2       0x1E
 #define REG_PREAMBLE_MSB         0x20
@@ -163,16 +164,7 @@ static uint8_t sx1278_read_register(uint8_t address)
         &transaction
     );
 
-    if (error != ESP_OK)
-    {
-        ESP_LOGE(
-            TAG,
-            "Erro de leitura SPI: %s",
-            esp_err_to_name(error)
-        );
-
-        return 0;
-    }
+    ESP_ERROR_CHECK(error);
 
     return rx_data[1];
 }
@@ -310,15 +302,8 @@ static void sx1278_configure_receiver(void)
         0x12
     );
 
-    /*
-     * Ganho automático do receptor.
-     */
-    uint8_t lna = sx1278_read_register(REG_LNA);
-
-    sx1278_write_register(
-        REG_LNA,
-        lna | 0x03
-    );
+    sx1278_write_register(REG_PA_CONFIG, 0x8A); // PA_BOOST, ~12 dBm
+    sx1278_write_register(REG_FIFO_TX_BASE_ADDR, 0x00);
 
     /*
      * Área de recepção do FIFO começa em zero.
@@ -383,17 +368,9 @@ static bool parse_packet_sequence(
      * Formato esperado:
      * SEQ=00001;MSG=STM32-LORA
      */
-    if (length < 10)
-    {
-        return false;
-    }
-
-    if (memcmp(payload, "SEQ=", 4) != 0)
-    {
-        return false;
-    }
-
-    if (payload[9] != ';')
+    if (length != sizeof("SEQ=00000;MSG=STM32-LORA") - 1 ||
+        memcmp(payload, "SEQ=", 4) != 0 ||
+        memcmp(payload + 9, ";MSG=STM32-LORA", sizeof(";MSG=STM32-LORA") - 1) != 0)
     {
         return false;
     }
@@ -534,6 +511,57 @@ static void update_link_metrics(uint32_t sequence)
     );
 }
 
+// Sempre restaurar RX, inclusive quando a transmissao do ACK expirar.
+static void sx1278_enter_rx(void)
+{
+    sx1278_write_register(REG_OP_MODE, MODE_LORA_STANDBY);
+    sx1278_write_register(REG_DIO_MAPPING_1, 0x00); // DIO0 = RxDone
+    sx1278_write_register(REG_FIFO_ADDR_PTR, 0x00);
+    sx1278_write_register(REG_IRQ_FLAGS, 0xFF);
+    sx1278_write_register(REG_OP_MODE, MODE_LORA_RX_CONTINUOUS);
+}
+
+static bool sx1278_send_ack(uint32_t sequence)
+{
+    char ack[10]; // 9 bytes no ar, mais terminador local.
+    int length = snprintf(ack, sizeof(ack), "ACK=%05" PRIu32, sequence);
+    if (length != 9) {
+        sx1278_enter_rx();
+        return false;
+    }
+
+    sx1278_write_register(REG_OP_MODE, MODE_LORA_STANDBY);
+    // Arredonda para cima para nao virar zero ticks.
+    vTaskDelay(pdMS_TO_TICKS(ACK_TURNAROUND_MS) + 1);
+    sx1278_write_register(REG_DIO_MAPPING_1, 0x40); // DIO0 = TxDone
+    sx1278_write_register(REG_FIFO_ADDR_PTR, 0x00);
+    for (int i = 0; i < length; ++i) {
+        sx1278_write_register(REG_FIFO, (uint8_t)ack[i]);
+    }
+    sx1278_write_register(REG_PAYLOAD_LENGTH, (uint8_t)length);
+    sx1278_write_register(REG_IRQ_FLAGS, 0xFF);
+    sx1278_write_register(REG_OP_MODE, MODE_LORA_TX);
+
+    TickType_t start = xTaskGetTickCount();
+    bool sent = false;
+    do {
+        if (sx1278_read_register(REG_IRQ_FLAGS) & IRQ_TX_DONE) {
+            sent = true;
+            break;
+        }
+        vTaskDelay(1);
+    } while ((TickType_t)(xTaskGetTickCount() - start) <
+             pdMS_TO_TICKS(ACK_TX_TIMEOUT_MS));
+
+    sx1278_enter_rx();
+    if (sent) {
+        ESP_LOGI(TAG, "ACK enviado: %s (TxDone)", ack);
+    } else {
+        ESP_LOGW(TAG, "Timeout ao transmitir %s", ack);
+    }
+    return sent;
+}
+
 static void sx1278_receive_packet(void)
 {
     uint8_t irq_flags =
@@ -550,11 +578,12 @@ static void sx1278_receive_packet(void)
     /*
      * Descarta pacotes com erro de CRC.
      */
-    if ((irq_flags & IRQ_PAYLOAD_CRC_ERROR) != 0)
+    if ((irq_flags & IRQ_PAYLOAD_CRC_ERROR) != 0 ||
+        (sx1278_read_register(REG_HOP_CHANNEL) & 0x40) == 0)
     {
         ESP_LOGW(
             TAG,
-            "Pacote descartado: erro de CRC"
+            "Pacote descartado: CRC ausente ou incorreto"
         );
 
         sx1278_write_register(
@@ -564,6 +593,8 @@ static void sx1278_receive_packet(void)
 
         return;
     }
+
+    sx1278_write_register(REG_OP_MODE, MODE_LORA_STANDBY);
 
     uint8_t packet_length =
         sx1278_read_register(REG_RX_NB_BYTES);
@@ -615,6 +646,14 @@ static void sx1278_receive_packet(void)
         rssi_dbm += snr_db;
     }
 
+    uint32_t sequence = 0;
+    bool valid = parse_packet_sequence(payload, packet_length, &sequence);
+    if (valid) {
+        sx1278_send_ack(sequence);
+    } else {
+        sx1278_enter_rx();
+    }
+
     ESP_LOGI(TAG, "==============================");
 
     ESP_LOGI(
@@ -629,21 +668,10 @@ static void sx1278_receive_packet(void)
         packet_length
     );
 
-    uint32_t sequence = 0;
-
-    if (parse_packet_sequence(
-        payload,
-        packet_length,
-        &sequence))
-    {
-    update_link_metrics(sequence);
-    }
-    else
-    {
-    ESP_LOGW(
-        TAG,
-        "Formato de pacote desconhecido"
-    );
+    if (valid) {
+        update_link_metrics(sequence);
+    } else {
+        ESP_LOGW(TAG, "Formato de pacote desconhecido; sem ACK");
     }
 
     ESP_LOGI(
@@ -660,19 +688,13 @@ static void sx1278_receive_packet(void)
 
     ESP_LOGI(TAG, "==============================");
 
-    /*
-     * Limpa RxDone e as demais interrupções.
-     */
-    sx1278_write_register(
-        REG_IRQ_FLAGS,
-        0xFF
-    );
+
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "LoRa Link Analyzer");
-    ESP_LOGI(TAG, "ESP32 Gateway/Receptor");
+    ESP_LOGI(TAG, "ESP32 Gateway RX + ACK");
 
     sx1278_gpio_init();
     sx1278_spi_init();

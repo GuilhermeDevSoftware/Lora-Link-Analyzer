@@ -36,6 +36,16 @@ const REG_VERSION: u8 = 0x42;
 
 // Bits do registrador RegIrqFlags
 const IRQ_TX_DONE: u8 = 0x08;
+const IRQ_RX_DONE: u8 = 0x40;
+const IRQ_CRC_ERROR: u8 = 0x20;
+const REG_FIFO_RX_BASE_ADDR: u8 = 0x0F;
+const REG_FIFO_RX_CURRENT_ADDR: u8 = 0x10;
+const REG_RX_NB_BYTES: u8 = 0x13;
+const REG_HOP_CHANNEL: u8 = 0x1C;
+const MODE_LORA_RX: u8 = 0x8D;
+// Limite por sondagens com delay de 1 ms; nao e cronometro de latencia.
+const ACK_WAIT_POLLS: u32 = 1500;
+
 
 // Modos do SX1278 para frequência abaixo de 525 MHz
 const MODE_LORA_SLEEP: u8 = 0x88;
@@ -44,7 +54,7 @@ const MODE_LORA_TX: u8 = 0x8B;
 
 const SX127X_EXPECTED_VERSION: u8 = 0x12;
 
-const PACKET_LENGTH: usize = 24;
+const PACKET_LENGTH: usize = b"SEQ=00000;MSG=STM32-LORA".len();
 
 const PACKET_TEMPLATE: &[u8; PACKET_LENGTH] = b"SEQ=00000;MSG=STM32-LORA";
 
@@ -102,7 +112,7 @@ fn main() -> ! {
      */
     let mut cs = gpiob.pb6.into_push_pull_output();
     let mut reset = gpioc.pc7.into_push_pull_output();
-    let dio0 = gpioa.pa10.into_pull_down_input();
+    let _dio0 = gpioa.pa10.into_pull_down_input(); // IRQ consultada por SPI
 
     let mut delay = Delay::new(cp.SYST, rcc.clocks.hclk().raw());
 
@@ -140,6 +150,7 @@ fn main() -> ! {
             let success = spi.transfer_in_place(&mut data).is_ok();
             let _ = cs.set_high();
 
+            assert!(success, "Falha SPI ao escrever registrador");
             success
         }};
     }
@@ -156,6 +167,7 @@ fn main() -> ! {
             let success = spi.transfer_in_place(&mut data).is_ok();
             let _ = cs.set_high();
 
+            assert!(success, "Falha SPI ao ler registrador");
             (success, data[1])
         }};
     }
@@ -241,6 +253,8 @@ fn main() -> ! {
     // Início da região de transmissão do FIFO
     write_register!(REG_FIFO_TX_BASE_ADDR, 0x00);
 
+    write_register!(REG_FIFO_RX_BASE_ADDR, 0x00);
+
     // Limpa todas as interrupções anteriores
     write_register!(REG_IRQ_FLAGS, 0xFF);
 
@@ -252,73 +266,101 @@ fn main() -> ! {
     defmt::info!("Iniciando transmissoes");
 
     let mut packet_number: u32 = 1;
+    let mut tx_ok: u32 = 0;
+    let mut tx_errors: u32 = 0;
+    let mut ack_ok: u32 = 0;
+    let mut ack_timeouts: u32 = 0;
+    let mut ack_rejected: u32 = 0;
 
     loop {
-        // Retorna ao modo Standby antes de preparar o pacote
         write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
-
-        // Aponta o FIFO para o início da área de transmissão
+        write_register!(REG_DIO_MAPPING_1, 0x40);
         write_register!(REG_FIFO_ADDR_PTR, 0x00);
-
-        /*
-         * Primeiro byte da transferência é o endereço do FIFO.
-         * Os demais bytes são a mensagem.
-         */
         let packet = build_packet(packet_number);
-
         let mut fifo_data = [0_u8; PACKET_LENGTH + 1];
-
         fifo_data[0] = REG_FIFO | 0x80;
         fifo_data[1..].copy_from_slice(&packet);
-
         let _ = cs.set_low();
         let fifo_ok = spi.transfer_in_place(&mut fifo_data).is_ok();
         let _ = cs.set_high();
-
-        // Informa ao rádio o tamanho da mensagem
+        assert!(fifo_ok, "Falha SPI ao preencher FIFO");
         write_register!(REG_PAYLOAD_LENGTH, PACKET_LENGTH as u8);
-
-        // Limpa as interrupções antes de transmitir
         write_register!(REG_IRQ_FLAGS, 0xFF);
-
         defmt::info!("Transmitindo pacote: {=u32}", packet_number);
-
-        defmt::info!("FIFO preenchido: {=bool}", fifo_ok);
-
-        // Inicia a transmissão
         write_register!(REG_OP_MODE, MODE_LORA_TX);
 
-        /*
-         * Aguarda DIO0 ficar alto.
-         * Existe um timeout de 2 segundos para evitar travamento.
-         */
-        let mut timeout_ms: u32 = 0;
-
-        while dio0.is_low() && timeout_ms < 2000 {
+        let mut tx_done = false;
+        for _ in 0..2000 {
+            let (_, flags) = read_register!(REG_IRQ_FLAGS);
+            if flags & IRQ_TX_DONE != 0 {
+                tx_done = true;
+                break;
+            }
             delay.delay_ms(1_u32);
-            timeout_ms += 1;
         }
-
-        // Também verifica o TxDone diretamente no registrador
-        let (irq_read_ok, irq_flags) = read_register!(REG_IRQ_FLAGS);
-
-        let tx_done = irq_read_ok && (irq_flags & IRQ_TX_DONE) != 0;
 
         if tx_done {
-            defmt::info!("TxDone confirmado. Pacote: {=u32}", packet_number);
+            // Entrar em RX ANTES de imprimir logs para nao atrasar o ACK.
+            write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+            write_register!(REG_DIO_MAPPING_1, 0x00);
+            write_register!(REG_FIFO_ADDR_PTR, 0x00);
+            write_register!(REG_IRQ_FLAGS, 0xFF);
+            write_register!(REG_OP_MODE, MODE_LORA_RX);
+            tx_ok += 1;
+
+            let mut expected = *b"ACK=00000";
+            expected[4..9].copy_from_slice(&packet[4..9]);
+            let mut confirmed = false;
+            for _ in 0..ACK_WAIT_POLLS {
+                let (_, flags) = read_register!(REG_IRQ_FLAGS);
+                if flags & IRQ_RX_DONE != 0 {
+                    write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+                    let (_, length) = read_register!(REG_RX_NB_BYTES);
+                    let (_, hop) = read_register!(REG_HOP_CHANNEL);
+                    if flags & IRQ_CRC_ERROR == 0 && hop & 0x40 != 0 && length == 9 {
+                        let (_, address) = read_register!(REG_FIFO_RX_CURRENT_ADDR);
+                        write_register!(REG_FIFO_ADDR_PTR, address);
+                        let mut buffer = [0_u8; 10];
+                        buffer[0] = REG_FIFO & 0x7F;
+                        let _ = cs.set_low();
+                        let ok = spi.transfer_in_place(&mut buffer).is_ok();
+                        let _ = cs.set_high();
+                        assert!(ok, "Falha SPI ao ler ACK");
+                        confirmed = buffer[1..] == expected[..];
+                    }
+                    write_register!(REG_IRQ_FLAGS, 0xFF);
+                    if confirmed {
+                        break;
+                    }
+                    ack_rejected += 1;
+                    write_register!(REG_OP_MODE, MODE_LORA_RX);
+                }
+                delay.delay_ms(1_u32);
+            }
+            write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+            if confirmed {
+                ack_ok += 1;
+                defmt::info!("ACK confirmado. Pacote: {=u32}", packet_number);
+            } else {
+                ack_timeouts += 1;
+                defmt::warn!("Timeout ACK. Pacote: {=u32}", packet_number);
+            }
         } else {
-            defmt::warn!("TxDone nao confirmado. IRQ flags: {=u8}", irq_flags);
+            tx_errors += 1;
+            defmt::warn!("TxDone nao confirmado. Pacote: {=u32}", packet_number);
         }
-
-        // Limpa TxDone e outras interrupções
-        write_register!(REG_IRQ_FLAGS, 0xFF);
-
-        // Retorna para Standby
         write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+        write_register!(REG_IRQ_FLAGS, 0xFF);
+        defmt::info!("TX OK: {=u32}; falhas TX: {=u32}; ACK OK: {=u32}; timeouts ACK: {=u32}; RX rejeitados: {=u32}",
+            tx_ok, tx_errors, ack_ok, ack_timeouts, ack_rejected);
 
-        packet_number = packet_number.wrapping_add(1);
-
-        // Um novo pacote a cada dois segundos
+        // Ensaio limitado: evita reutilizar sequencias e aceitar ACK antigo.
+        if packet_number == 99_999 {
+            defmt::info!("Ensaio concluido. Reinicie as duas placas para novo ensaio.");
+            loop { delay.delay_ms(1000_u32); }
+        }
+        packet_number += 1;
+        // Pausa apos o resultado: periodo total inclui TX e espera pelo ACK.
         delay.delay_ms(2000_u32);
     }
 }
