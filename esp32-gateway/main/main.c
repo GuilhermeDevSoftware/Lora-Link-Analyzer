@@ -49,6 +49,8 @@
 #define REG_DIO_MAPPING_1        0x40
 #define REG_VERSION              0x42
 
+#define TEST_DROP_FIRST_ACK 0
+
 /*
  * Interrupções
  */
@@ -432,6 +434,12 @@ static void update_link_metrics(uint32_t sequence)
     else if (sequence == last_sequence)
     {
         total_duplicates++;
+
+        ESP_LOGW(
+        TAG,
+        "Duplicata recebida: %" PRIu32,
+        sequence
+        );
     }
     else if (sequence > last_sequence)
     {
@@ -647,11 +655,32 @@ static void sx1278_receive_packet(void)
     }
 
     uint32_t sequence = 0;
-    bool valid = parse_packet_sequence(payload, packet_length, &sequence);
-    if (valid) {
-        sx1278_send_ack(sequence);
+
+bool valid = parse_packet_sequence(
+    payload,
+    packet_length,
+    &sequence
+);
+
+// As métricas ainda representam o pacote anterior neste ponto.
+bool first_reception =
+    !sequence_initialized || sequence != last_sequence;
+
+bool omit_ack =
+    TEST_DROP_FIRST_ACK && first_reception;
+
+    if (valid && !omit_ack) {
+    sx1278_send_ack(sequence);
     } else {
-        sx1278_enter_rx();
+    sx1278_enter_rx();
+
+        if (valid && omit_ack) {
+        ESP_LOGW(
+            TAG,
+            "TESTE: primeiro ACK omitido. Sequencia: %" PRIu32,
+            sequence
+        );
+        }
     }
 
     ESP_LOGI(TAG, "==============================");

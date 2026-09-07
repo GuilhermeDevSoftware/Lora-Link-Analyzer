@@ -45,6 +45,11 @@ const REG_HOP_CHANNEL: u8 = 0x1C;
 const MODE_LORA_RX: u8 = 0x8D;
 // Limite por sondagens com delay de 1 ms; nao e cronometro de latencia.
 const ACK_WAIT_POLLS: u32 = 1500;
+// Uma transmissão inicial e até dois reenvios.
+const MAX_ATTEMPTS: u32 = 3;
+
+// Pausa adicional antes de cada reenvio.
+const RETRY_DELAY_MS: u32 = 200;
 
 
 // Modos do SX1278 para frequência abaixo de 525 MHz
@@ -271,8 +276,19 @@ fn main() -> ! {
     let mut ack_ok: u32 = 0;
     let mut ack_timeouts: u32 = 0;
     let mut ack_rejected: u32 = 0;
+    let mut retries: u32 = 0;
+    let mut unconfirmed_packets: u32 = 0;
 
     loop {
+    // Reinicia o resultado ao começar um novo pacote.
+    let mut delivered = false;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            retries += 1;
+            delay.delay_ms(RETRY_DELAY_MS);
+        }
+
         write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
         write_register!(REG_DIO_MAPPING_1, 0x40);
         write_register!(REG_FIFO_ADDR_PTR, 0x00);
@@ -286,7 +302,12 @@ fn main() -> ! {
         assert!(fifo_ok, "Falha SPI ao preencher FIFO");
         write_register!(REG_PAYLOAD_LENGTH, PACKET_LENGTH as u8);
         write_register!(REG_IRQ_FLAGS, 0xFF);
-        defmt::info!("Transmitindo pacote: {=u32}", packet_number);
+        defmt::info!(
+        "Transmitindo pacote: {=u32}; tentativa: {=u32}/{=u32}",
+        packet_number,
+        attempt,
+        MAX_ATTEMPTS
+        );
         write_register!(REG_OP_MODE, MODE_LORA_TX);
 
         let mut tx_done = false;
@@ -339,8 +360,13 @@ fn main() -> ! {
             }
             write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
             if confirmed {
+                delivered = true;
                 ack_ok += 1;
-                defmt::info!("ACK confirmado. Pacote: {=u32}", packet_number);
+
+                defmt::info!(
+                "ACK confirmado. Pacote: {=u32}",
+                packet_number
+        );
             } else {
                 ack_timeouts += 1;
                 defmt::warn!("Timeout ACK. Pacote: {=u32}", packet_number);
@@ -349,10 +375,41 @@ fn main() -> ! {
             tx_errors += 1;
             defmt::warn!("TxDone nao confirmado. Pacote: {=u32}", packet_number);
         }
-        write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
+                write_register!(REG_OP_MODE, MODE_LORA_STANDBY);
         write_register!(REG_IRQ_FLAGS, 0xFF);
-        defmt::info!("TX OK: {=u32}; falhas TX: {=u32}; ACK OK: {=u32}; timeouts ACK: {=u32}; RX rejeitados: {=u32}",
-            tx_ok, tx_errors, ack_ok, ack_timeouts, ack_rejected);
+
+        // Recebeu ACK: não precisa realizar as próximas tentativas.
+        if delivered {
+            break;
+        }
+    } // Fecha o for de tentativas.
+
+    // Só chega aqui sem confirmação após esgotar as tentativas.
+    if !delivered {
+        unconfirmed_packets += 1;
+
+        defmt::warn!(
+            "Pacote sem confirmacao apos {=u32} tentativas: {=u32}",
+            MAX_ATTEMPTS,
+            packet_number
+        );
+        }
+
+        defmt::info!(
+        "Pacotes finalizados: {=u32}; confirmados: {=u32}; sem confirmacao: {=u32}; reenvios: {=u32}",
+        packet_number,
+        ack_ok,
+        unconfirmed_packets,
+        retries
+        );
+
+        defmt::info!(
+        "TX OK: {=u32}; falhas TX: {=u32}; timeouts ACK: {=u32}; RX rejeitados: {=u32}",
+        tx_ok,
+        tx_errors,
+        ack_timeouts,
+        ack_rejected
+            );
 
         // Ensaio limitado: evita reutilizar sequencias e aceitar ACK antigo.
         if packet_number == 99_999 {
