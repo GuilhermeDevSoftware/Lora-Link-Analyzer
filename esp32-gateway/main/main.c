@@ -698,10 +698,43 @@ bool omit_ack =
     );
 
     if (valid) {
+    /*
+     * Verifica antes de atualizar last_sequence.
+     * Depois da atualização, a comparação perderia o sentido.
+     */
+        bool is_duplicate =
+        sequence_initialized && sequence == last_sequence;
+
         update_link_metrics(sequence);
-    } else {
-        ESP_LOGW(TAG, "Formato de pacote desconhecido; sem ACK");
-    }
+
+    /*
+     * Uma linha CSV por recepção válida.
+     *
+     * Ordem:
+     * identificador, sequência, bytes, RSSI, SNR,
+     * duplicata, únicos, lacunas, duplicatas, fora de ordem
+     */
+        printf(
+        "LORA_DATA,%" PRIu32 ",%u,%.1f,%.2f,%u,"
+        "%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
+        sequence,
+        (unsigned int)packet_length,
+        (double)rssi_dbm,
+        (double)snr_db,
+        (unsigned int)is_duplicate,
+        total_received,
+        total_lost,
+        total_duplicates,
+        total_out_of_order
+        );
+
+        fflush(stdout);
+        } else {
+            ESP_LOGW(
+            TAG,
+            "Formato de pacote desconhecido; sem ACK"
+            );
+     }
 
     ESP_LOGI(
         TAG,
