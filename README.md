@@ -1,22 +1,14 @@
 # LoRa Link Analyzer
 
-Projeto de estudo e portfólio para desenvolver um analisador de enlace LoRa utilizando **STM32 com Rust embarcado**, **ESP32 com C/ESP-IDF** e **Python para coleta e armazenamento dos resultados**, com **MATLAB Online para análise estatística e gráficos**.
+Projeto de estudo e portfólio que integra **STM32 com Rust embarcado**, **ESP32 com C/ESP-IDF**, **Python para coleta serial** e **MATLAB Online para análise dos resultados**.
+
+**Versão inicial concluída em 10/10/2026.**
 
 ## Objetivo
 
-Transmitir pacotes de teste entre dois rádios LoRa e avaliar a comunicação por meio de:
+Transmitir pacotes sequenciais entre dois rádios LoRa e avaliar a comunicação por meio de RSSI, SNR, confirmações, retransmissões, duplicatas e lacunas de sequência.
 
-- RSSI e SNR;
-- pacotes únicos recebidos;
-- lacunas de sequência;
-- pacotes duplicados ou fora de ordem;
-- taxa de entrega observada no receptor;
-- confirmações de recebimento;
-- timeouts e retransmissões;
-- análise estatística e gráficos no MATLAB Online;
-- latência/RTT, em uma etapa futura.
-
-O ESP32 funciona como gateway conectado ao computador por USB. A STM32 atua como nó remoto, transmite os pacotes de teste e aguarda confirmações.
+O projeto utiliza **LoRa ponto a ponto em 433 MHz**, sem LoRaWAN.
 
 ## Arquitetura
 
@@ -24,46 +16,35 @@ O ESP32 funciona como gateway conectado ao computador por USB. A STM32 atua como
 | --- | --- | --- | --- |
 | Nó remoto | STM32 Nucleo-F446RE + SX1278 | Rust embarcado | Transmitir pacotes, receber ACKs e realizar reenvios |
 | Base | ESP32 + SX1278 | C com ESP-IDF | Receber pacotes, responder ACKs e emitir métricas pela USB |
-| Computador | PC conectado à base por USB | Python com pySerial | Ler os dados estruturados e salvar arquivos CSV |
-| Análise | Navegador no computador | MATLAB Online | Importar CSVs, calcular estatísticas e gerar gráficos |
+| Computador | PC conectado à base por USB | Python com pySerial | Salvar as recepções em CSV |
+| Análise | MATLAB Online | Script MATLAB | Calcular métricas, comparar sessões e exportar gráficos |
 
-Os dois módulos utilizam o SX1278 e operam em **433 MHz**. A comunicação é **LoRa ponto a ponto**, sem LoRaWAN.
+A STM32 também foi testada alimentada por power bank, enquanto o ESP32 permaneceu conectado ao computador para coleta.
 
-## Estado atual
+## Funcionalidades concluídas
 
-Atualizado em **09/10/2026**.
+- Comunicação SPI e identificação dos rádios.
+- Comunicação LoRa bidirecional.
+- Pacotes com número sequencial.
+- Confirmação por ACK.
+- Timeout e até três tentativas totais por pacote.
+- Tratamento de duplicatas no receptor.
+- Recuperação após desligar e religar o gateway.
+- Teste controlado de omissão de ACK.
+- Saída serial estruturada.
+- Coleta Python com armazenamento em CSV.
+- Análise inicial e comparação de sessões no MATLAB Online.
+- Exportação de gráficos e tabela de resultados.
 
-Estão funcionando e validados em bancada:
+## Protocolo
 
-- comunicação bidirecional STM32 ↔ ESP32;
-- confirmação de recebimento por ACK;
-- timeout de espera pelo ACK;
-- até três tentativas por pacote;
-- tratamento de duplicatas no ESP32;
-- recuperação após desligar e religar o gateway;
-- emissão de dados estruturados pela serial;
-- coleta em Python e armazenamento em CSV;
-- importação dos dados no MATLAB Online;
-- estatísticas de RSSI e SNR;
-- gráficos de RSSI e SNR por sequência;
-- conferência de sequências distintas, duplicatas e ausências no intervalo observado;
-- exportação dos gráficos em PNG e registro dos resultados no GitHub.
-
-A primeira coleta salva contém **83 registros**. Em **09/10/2026**, uma nova sessão gerou **199 registros**, analisados no MATLAB Online. O próximo passo é reunir os comandos em um script `analise_lora.m` para repetir a análise nas próximas coletas.
-
-## Protocolo atual
-
-### Pacote de dados
-
-A STM32 transmite uma mensagem de 24 bytes:
+Mensagem de dados: **24 bytes**.
 
 ```text
 SEQ=00012;MSG=STM32-LORA
 ```
 
-### Confirmação
-
-O ESP32 responde com uma mensagem de 9 bytes:
+Confirmação: **9 bytes**.
 
 ```text
 ACK=00012
@@ -71,25 +52,21 @@ ACK=00012
 
 O terminador de string não é transmitido.
 
-### Fluxo de comunicação
+### Fluxo
 
-1. A STM32 gera um pacote com número sequencial.
-2. O rádio transmite e sinaliza `TxDone`.
-3. A STM32 entra em recepção para aguardar o ACK.
-4. O ESP32 recebe e valida os dados.
-5. O ESP32 transmite o ACK correspondente e retorna à recepção.
-6. A STM32 verifica CRC, tamanho, conteúdo e sequência da resposta.
-7. Se o ACK for válido, avança para o próximo pacote.
-8. Se houver timeout, reenvia a mesma sequência.
-9. Após três tentativas sem confirmação, registra o resultado e segue para o próximo pacote.
+1. A STM32 transmite uma sequência e aguarda o ACK.
+2. O ESP32 recebe os dados, registra as métricas e responde.
+3. A STM32 valida a resposta e avança para o próximo pacote.
+4. Se ocorrer timeout, retransmite a mesma sequência.
+5. Após três tentativas sem confirmação, registra o resultado e avança.
 
-O limite é de **três tentativas totais: um envio inicial e até dois reenvios**.
+O limite corresponde a **um envio inicial e até dois reenvios**.
 
-Uma duplicata recebida pelo ESP32 é confirmada novamente, mas não é contabilizada como uma nova entrega única.
+Duplicatas são confirmadas novamente pelo ESP32, sem aumentar o contador de pacotes únicos.
 
-> `TxDone` confirma apenas que o rádio concluiu a transmissão local. A ausência de ACK pode representar perda dos dados ou perda da resposta.
+> `TxDone` indica conclusão da transmissão local. Um timeout de ACK pode ocorrer por perda dos dados ou da resposta; não comprova sozinho perda do pacote no receptor.
 
-## Parâmetros atuais
+## Parâmetros utilizados
 
 | Parâmetro | Valor |
 | --- | --- |
@@ -101,156 +78,72 @@ Uma duplicata recebida pelo ESP32 é confirmada novamente, mas não é contabili
 | Header | Explícito |
 | CRC | Ativado |
 | Sync Word | `0x12` |
-| Potência configurada nos rádios | Aproximadamente 12 dBm, usando PA_BOOST |
+| Potência configurada | Aproximadamente 12 dBm, usando PA_BOOST |
 | Tentativas por pacote | Até 3 |
 | Espera pelo ACK na STM32 | Cerca de 1,5 s, mais processamento |
 | Pausa adicional antes de reenvio | 200 ms |
-| Espera do ESP32 antes de transmitir ACK | Pelo menos 50 ms |
+| Espera do ESP32 antes do ACK | Pelo menos 50 ms |
 | Pausa após finalizar um pacote | 2 s |
 
-A espera pelo ACK utiliza 1.500 sondagens com atraso de 1 ms. Não é uma medição precisa de latência.
+O período entre pacotes inclui transmissão, confirmação e possíveis reenvios. Com confirmação normal, foi observado um intervalo próximo de **2,17 s**.
 
-O período entre pacotes inclui transmissão, espera pelo ACK, possíveis reenvios e a pausa final. Nas primeiras linhas da coleta CSV, o intervalo observado foi próximo de **2,17 s**, com confirmação normal.
+## Testes funcionais
 
-## Métricas
-
-### STM32
-
-| Contador | Significado |
+| Teste | Resultado |
 | --- | --- |
-| Pacotes finalizados | Pacotes que receberam ACK ou esgotaram as tentativas |
-| Confirmados | Pacotes com ACK válido |
-| Sem confirmação | Pacotes que esgotaram as três tentativas |
-| Reenvios | Tentativas adicionais à primeira |
-| TX OK | Transmissões locais concluídas, incluindo reenvios |
-| Falhas TX | Tentativas sem confirmação de `TxDone` |
-| Timeouts ACK | Tentativas com TX concluído, mas sem ACK válido na janela |
-| RX rejeitados | Recepções que não passaram pela validação do ACK |
+| Salto proposital de sequência | Lacuna identificada pelo ESP32 |
+| Comunicação com ACK | Confirmações recebidas pela STM32 |
+| Gateway desligado | Timeouts registrados sem interromper o transmissor |
+| Limite de tentativas | Até três transmissões antes de avançar |
+| Gateway religado | Confirmações retomadas |
+| Omissão controlada do primeiro ACK | Reenvio e confirmação na segunda tentativa |
+| Pacote duplicado | Nova confirmação sem duplicar a entrega única |
+| STM32 no power bank | Transmissão mantida sem computador conectado |
 
-Exemplo observado:
-
-```text
-Transmitindo pacote: 215; tentativa: 1/3
-ACK confirmado. Pacote: 215
-Pacotes finalizados: 215; confirmados: 214; sem confirmacao: 1; reenvios: 5
-TX OK: 220; falhas TX: 0; timeouts ACK: 6; RX rejeitados: 2
-```
-
-Esse acumulado é um registro funcional da sessão. Não representa, sozinho, uma caracterização da confiabilidade do enlace.
-
-### ESP32
-
-O gateway registra:
-
-- sequência recebida;
-- tamanho do pacote;
-- RSSI e SNR;
-- pacotes únicos recebidos;
-- lacunas entre sequências;
-- duplicatas;
-- pacotes fora de ordem;
-- taxa de entrega calculada a partir dos contadores do receptor.
-
-A taxa exibida utiliza:
-
-```text
-taxa de entrega = recebidos / (recebidos + lacunas) × 100
-```
-
-O contador atualmente exibido como “Pacotes perdidos” representa lacunas inferidas entre sequências recebidas.
-
-## Testes realizados
-
-| Teste | Resultado observado |
-| --- | --- |
-| Salto proposital de sequência | ESP32 identificou a lacuna e atualizou as métricas |
-| Comunicação com ACK | STM32 recebeu confirmações das sequências enviadas |
-| ESP32 desligado | STM32 registrou timeouts e continuou executando |
-| Limite de tentativas | Mesma sequência transmitida até três vezes antes de avançar |
-| ESP32 religado | Confirmações retornaram sem reiniciar a STM32 |
-| Omissão controlada do primeiro ACK | STM32 reenviou e recebeu confirmação na segunda tentativa |
-| Tratamento de duplicatas | ESP32 incrementou duplicatas sem aumentar entregas únicas |
-| Primeira coleta serial em Python | Arquivo CSV salvo com 83 registros em 07/09/2026 |
-| Nova coleta serial em Python | Arquivo CSV salvo com 199 registros em 09/10/2026 |
-| Análise no MATLAB Online | Estatísticas, gráficos e conferência de sequências realizados |
-| Exportação e versionamento | Gráficos PNG exportados e registrados no GitHub |
-
-### Teste controlado de perda de ACK
-
-O firmware ESP32 possui a opção:
+O teste de omissão de ACK utiliza:
 
 ```c
 #define TEST_DROP_FIRST_ACK 0
 ```
 
-Com valor `1`, o gateway omite o ACK da primeira recepção de cada nova sequência. Os dados continuam sendo contabilizados.
+Com valor `1`, o primeiro ACK de cada nova sequência é omitido. Após a validação, a opção foi restaurada para `0`.
 
-No reenvio, o ESP32 identifica a duplicata e responde com ACK.
+## Coleta serial em Python
 
-Exemplo observado na STM32:
-
-```text
-Transmitindo pacote: 4; tentativa: 1/3
-Timeout ACK. Pacote: 4
-Transmitindo pacote: 4; tentativa: 2/3
-ACK confirmado. Pacote: 4
-```
-
-No ESP32, o reenvio da sequência 12 manteve os recebidos em 12 e aumentou as duplicatas de 11 para 12.
-
-**Após o teste, a opção foi restaurada para `0` e o funcionamento normal foi confirmado.**
-
-## Dados estruturados pela serial
-
-Além dos logs, o ESP32 emite uma linha por recepção válida:
+O ESP32 emite uma linha por recepção válida:
 
 ```text
 LORA_DATA,3,24,-114.0,7.50,0,3,0,0,0
 ```
 
-| Posição | Campo |
+Os campos são:
+
+| Campo | Significado |
 | --- | --- |
-| 1 | Identificador `LORA_DATA` |
-| 2 | Sequência |
-| 3 | Tamanho em bytes |
-| 4 | RSSI em dBm |
-| 5 | SNR em dB |
-| 6 | Indicador de duplicata: `0` ou `1` |
-| 7 | Total de pacotes únicos recebidos |
-| 8 | Total de lacunas de sequência |
-| 9 | Total de duplicatas |
-| 10 | Total fora de ordem |
+| `sequence` | Número do pacote |
+| `payload_bytes` | Tamanho recebido |
+| `rssi_dbm` | RSSI informado pelo firmware |
+| `snr_db` | SNR informado pelo firmware |
+| `is_duplicate` | Indicador de duplicata |
+| `received_unique` | Contador de pacotes únicos |
+| `sequence_gaps` | Contador de lacunas de sequência |
+| `duplicates_total` | Contador de duplicatas |
+| `out_of_order_total` | Contador de pacotes fora de ordem |
 
-Duplicatas também geram linhas, permitindo preservar o histórico das recepções.
+O coletor acrescenta `pc_received_at_utc`, com o horário de processamento da linha no computador, e gera um CSV novo por execução.
 
-## Coletor Python
+**Esse horário não representa o instante exato da recepção pelo rádio e não mede latência.**
 
-O arquivo `pc-analysis/collector.py`:
-
-- abre a serial do ESP32;
-- filtra linhas iniciadas por `LORA_DATA`;
-- valida campos e valores;
-- preserva fragmentos até completar uma linha;
-- acrescenta o horário UTC de processamento no computador;
-- grava um CSV novo por execução;
-- permite encerrar com `Ctrl + C`.
-
-### Preparação
-
-No Ubuntu/WSL:
+### Preparação no WSL
 
 ```bash
 cd ~/projetos/Projeto-Lora-Stm/pc-analysis
-
 python3 -m venv .venv
 source .venv/bin/activate
-
 python -m pip install -r requirements.txt
 ```
 
 ### Execução
-
-Com as duas placas ligadas, a STM32 transmitindo e o USB do ESP32 disponível no WSL:
 
 ```bash
 cd ~/projetos/Projeto-Lora-Stm/pc-analysis
@@ -258,228 +151,114 @@ source .venv/bin/activate
 python collector.py
 ```
 
-A configuração atual utiliza `/dev/ttyUSB0` e 115200 baud.
+Configuração utilizada: `/dev/ttyUSB0`, 115200 baud.
 
-**Encerre o monitor do ESP-IDF antes de iniciar o coletor**, pois os dois programas utilizam a mesma porta serial.
+Encerre o monitor do ESP-IDF com **Ctrl + ]** antes de iniciar o coletor. Para finalizar a coleta, pressione **Ctrl + C**.
 
-Fechar o monitor no computador não interrompe o firmware do ESP32.
+## Histórico das coletas
 
-### Primeira coleta
+| Sessão | Registros | Observação |
+| --- | ---: | --- |
+| 07/09/2026 | 83 | Primeira coleta CSV |
+| 09/10/2026 | 199 | Primeira análise no MATLAB Online |
+| 10/10/2026 — próximo | 152 | Referência com placas próximas |
+| 10/10/2026 — posição variável | 153 | Deslocamentos entre locais e cômodos |
 
-Arquivo salvo:
+### Análise de 09/10/2026
 
-```text
-pc-analysis/data/lora_20260907_141447_038149.csv
-```
+Foram registradas 197 sequências distintas, de 38 a 234, sem sequências ausentes nesse intervalo e com duas duplicatas.
 
-Total informado ao encerrar: **83 registros**.
+As médias calculadas sobre os 199 registros, incluindo duplicatas, foram:
 
-Exemplo do conteúdo:
+- RSSI: **−116,5774 dBm**.
+- SNR: **4,5942 dB**.
 
-```csv
-pc_received_at_utc,sequence,payload_bytes,rssi_dbm,snr_db,is_duplicate,received_unique,sequence_gaps,duplicates_total,out_of_order_total
-2026-09-07T14:14:47.711+00:00,156,24,-111.0,8.0,0,1,0,0,0
-2026-09-07T14:14:49.881+00:00,157,24,-114.0,7.25,0,2,0,0,0
-2026-09-07T14:14:52.051+00:00,158,24,-114.0,7.0,0,3,0,0,0
-```
+Arquivos:
 
-A sequência pode começar acima de 1 porque a STM32 já estava transmitindo antes da coleta.
+- [CSV](pc-analysis/data/lora_20261009_212758_442277.csv)
+- [RSSI](pc-analysis/results/20261009/rssi_20261009.png)
+- [SNR](pc-analysis/results/20261009/snr_20261009.png)
 
-O horário registrado corresponde ao processamento da linha pelo Python. **Não é o instante exato da recepção LoRa nem uma medição de latência.**
+## Validação final — 10/10/2026
 
-## Análise no MATLAB Online — 09/10/2026
+Foram comparadas duas sessões com os mesmos parâmetros LoRa.
 
-A coleta serial continua sendo feita pelo Python. O MATLAB Online recebe o CSV após o término da sessão e realiza a análise; nesta etapa, não existe conexão direta entre o MATLAB Online e os rádios.
+### Condições
 
-### Arquivos da sessão
+**Próximo:** STM32 e ESP32 próximos, com a STM32 alimentada pelo power bank e o ESP32 conectado ao computador.
 
-- [CSV da coleta](pc-analysis/data/lora_20261009_212758_442277.csv)
-- [Gráfico de RSSI](pc-analysis/results/20261009/rssi_20261009.png)
-- [Gráfico de SNR](pc-analysis/results/20261009/snr_20261009.png)
+**Posição variável:** tentativa inicial no fundo da residência, a aproximadamente 35 metros, seguida de aproximações, afastamentos e mudanças de cômodo. Foi relatada ausência de recepção na posição inicial. A sessão registrada contém várias posições e obstáculos, sem distância fixa.
 
-O nome do CSV utiliza o horário UTC. As estatísticas abaixo foram calculadas sobre os **199 registros**, incluindo as duas duplicatas.
+A segunda sessão é um ensaio exploratório de variação do enlace, não uma medição controlada de alcance máximo.
 
 ### Resultados
 
-| Métrica | Resultado |
-| --- | --- |
-| Registros no CSV | 199 |
-| Sequências distintas | 197 |
-| Registros marcados como duplicatas | 2 |
-| Primeira sequência registrada | 38 |
-| Última sequência registrada | 234 |
-| Sequências esperadas no intervalo inclusivo | 197 |
-| Sequências ausentes nesse intervalo | 0 |
-| Taxa de recepção observada no intervalo | 100% |
-| Média dos valores de RSSI em dBm | −116,5774 dBm |
-| RSSI mínimo | −124,20 dBm |
-| RSSI máximo | −114,00 dBm |
-| SNR médio | 4,5942 dB |
-| SNR mínimo | −2,25 dB |
-| SNR máximo | 6,75 dB |
+| Métrica | Próximo | Posição variável |
+| --- | ---: | ---: |
+| Recepções registradas | 152 | 153 |
+| Pacotes únicos | 152 | 146 |
+| Duplicatas | 0 | 7 |
+| Primeira sequência | 69 | 6 |
+| Última sequência | 220 | 169 |
+| Sequências esperadas no intervalo | 152 | 164 |
+| Sequências ausentes no intervalo | 0 | 18 |
+| Recepção no intervalo observado | 100% | 89,02% |
+| Média dos valores de RSSI em dBm | −111,51 | −124,26 |
+| SNR médio em dB | 7,8816 | −2,5394 |
+| Duração entre primeira e última recepção | 327,68 s | 546,19 s |
+| Maior intervalo entre registros de recepção | 2,174 s | 72,537 s |
 
-A taxa foi calculada por:
+RSSI e SNR foram calculados usando somente a primeira recepção de cada sequência.
+
+A taxa de recepção utiliza:
 
 ```text
-sequências distintas / (última sequência − primeira sequência + 1) × 100
-197 / (234 − 38 + 1) × 100 = 100%
+pacotes únicos / (última sequência − primeira sequência + 1) × 100
 ```
 
-Todas as sequências de 38 a 234 foram registradas pelo menos uma vez. Isso inclui possíveis reenvios e **não significa sucesso de todas as primeiras tentativas ou de todos os ACKs**. A conta pressupõe que a numeração não reiniciou durante a coleta e não contempla perdas antes da primeira sequência ou depois da última.
-
-As duas duplicatas são compatíveis com o mecanismo de reenvio, mas o CSV do receptor não determina sozinho a causa de cada repetição.
+Essa conta pressupõe ausência de reinício ou reutilização das sequências durante cada sessão. Não inclui perdas anteriores ao primeiro pacote recebido ou posteriores ao último, nem representa sucesso das primeiras tentativas ou dos ACKs.
 
 ### Gráficos
 
-![RSSI dos pacotes recebidos](pc-analysis/results/20261009/rssi_20261009.png)
+![Comparação de RSSI](docs/images/comparacao_rssi_20261010.png)
 
-![SNR dos pacotes recebidos](pc-analysis/results/20261009/snr_20261009.png)
+![Comparação de SNR](docs/images/comparacao_snr_20261010.png)
 
-RSSI e SNR aumentaram na parte intermediária da coleta e caíram no final. Apesar da queda, nenhuma sequência ficou ausente no intervalo observado. A causa da variação não foi determinada nesta sessão.
+Cada sessão utiliza seu próprio tempo relativo, começando na primeira recepção registrada. Os pontos representam a primeira recepção de cada sequência. Não há medições de RSSI ou SNR para pacotes ausentes.
 
-Os pontos representam recepções registradas, incluindo duplicatas. As linhas conectam esses pontos e não representam medições de pacotes ausentes.
+### Interpretação
 
-### Repetir a análise
+Na condição próxima, todas as sequências do intervalo observado foram recebidas, sem duplicatas, com intervalos regulares.
 
-Envie o CSV ao MATLAB Drive e selecione sua pasta no MATLAB Online. Na Command Window:
+Na sessão com mudanças de posição, o RSSI médio ficou aproximadamente 12,75 dB menor. Foram observadas lacunas, duplicatas e um intervalo de 72,537 segundos entre registros consecutivos de recepção.
 
-```matlab
-dados = readtable("lora_20261009_212758_442277.csv");
+As duplicatas são compatíveis com retransmissões, mas os registros da base não determinam sozinhos o motivo de cada repetição.
 
-registros = height(dados)
-duplicatas = sum(dados.is_duplicate)
-sequencias = unique(dados.sequence);
-sequencias_distintas = numel(sequencias)
+Os resultados demonstram o funcionamento da coleta e da análise em condições diferentes. Não permitem determinar o alcance máximo nem atribuir as variações exclusivamente à distância, pois posição, obstáculos e orientação da montagem não foram controlados separadamente.
 
-primeira = min(sequencias)
-ultima = max(sequencias)
-esperados = ultima - primeira + 1
-ausentes = esperados - sequencias_distintas
-taxa_observada = 100 * sequencias_distintas / esperados
+### Arquivos
 
-rssi_medio = mean(dados.rssi_dbm)
-rssi_minimo = min(dados.rssi_dbm)
-rssi_maximo = max(dados.rssi_dbm)
+- [CSV próximo](pc-analysis/data/lora_20261010_172641_082828.csv)
+- [CSV com posição variável](pc-analysis/data/lora_20261010_173747_456161.csv)
+- [Script de comparação](pc-analysis/matlab/comparar_sessoes.m)
+- [Resumo CSV](pc-analysis/results/resumo_20261010.csv)
 
-snr_medio = mean(dados.snr_db)
-snr_minimo = min(dados.snr_db)
-snr_maximo = max(dados.snr_db)
+## Reproduzir a comparação no MATLAB Online
+
+1. Envie os dois CSVs de 10/10/2026 e `comparar_sessoes.m` ao MATLAB Drive.
+2. Coloque os três arquivos na mesma pasta.
+3. Selecione essa pasta como pasta atual do MATLAB.
+4. Abra o script e clique em **Run**.
+
+O script calcula o resumo, verifica a ordem das sequências distintas e exporta:
+
+```text
+resumo_20261010.csv
+comparacao_rssi_20261010.png
+comparacao_snr_20261010.png
 ```
 
-Para criar e exportar os gráficos, mantenha uma referência explícita a cada figura:
-
-```matlab
-fig_rssi = figure;
-plot(dados.sequence, dados.rssi_dbm, ".-");
-grid on
-xlabel("Sequência do pacote");
-ylabel("RSSI (dBm)");
-title("LoRa — RSSI dos pacotes recebidos");
-drawnow
-exportgraphics(fig_rssi, "rssi_20261009.png", "Resolution", 300);
-
-fig_snr = figure;
-plot(dados.sequence, dados.snr_db, ".-");
-grid on
-xlabel("Sequência do pacote");
-ylabel("SNR (dB)");
-title("LoRa — SNR dos pacotes recebidos");
-drawnow
-exportgraphics(fig_snr, "snr_20261009.png", "Resolution", 300);
-```
-
-Baixe os PNGs pelo MATLAB Drive e confira as imagens antes de substituir os arquivos em `pc-analysis/results/20261009/`. Para outra sessão, ajuste os nomes do CSV, dos gráficos e da pasta de resultados.
-
-Os comandos foram executados interativamente. O script reutilizável `analise_lora.m` ainda não foi criado.
-
-## Limitações atuais
-
-- O sistema foi desenvolvido para um transmissor e um gateway.
-- Ainda não existe identificador explícito de sessão.
-- Os contadores reiniciam com o respectivo microcontrolador.
-- O ESP32 usa o retorno à sequência 1, após uma sequência maior, como indício de reinício.
-- A STM32 encerra o ensaio na sequência 99999 para evitar reutilizar números durante a execução.
-- O tratamento de duplicatas atende aos reenvios consecutivos do protocolo atual.
-- Lacunas não detectam perdas anteriores à primeira sequência recebida nem posteriores à última.
-- O CSV representa as recepções do ESP32; não informa sozinho quantos ACKs chegaram à STM32.
-- O contador de recepções rejeitadas na STM32 ainda não separa os motivos de rejeição.
-- A análise no MATLAB foi executada interativamente; ainda não foi consolidada em um script reutilizável.
-- Ainda não foram implementadas medição de RTT, integração dos contadores da STM32 ao CSV ou comparação sistemática de alcance.
-- Os valores de RSSI e SNR são os informados pelo firmware, sem calibração independente nesta sessão.
-
-## Progresso
-
-### Concluído
-
-- [x] Preparação do Rust e do alvo `thumbv7em-none-eabihf`.
-- [x] Configuração do `probe-rs`, ST-LINK e logs RTT.
-- [x] Compilação e gravação da Nucleo-F446RE.
-- [x] Validação inicial com LED e SysTick.
-- [x] Ajustes de linker e memória.
-- [x] Preparação do gateway com ESP-IDF.
-- [x] Comunicação SPI e leitura de `RegVersion = 0x12` nas duas placas.
-- [x] Configuração compatível dos rádios em 433 MHz.
-- [x] Comunicação LoRa STM32 → ESP32.
-- [x] Pacotes com número sequencial.
-- [x] Métricas de RSSI, SNR, recebidos, lacunas e duplicatas.
-- [x] Cálculo da taxa de entrega observada.
-- [x] Comunicação bidirecional e ACK.
-- [x] Timeout de espera pelo ACK.
-- [x] Retransmissão com até três tentativas.
-- [x] Confirmação de duplicatas sem duplicar entregas.
-- [x] Testes de desligamento e recuperação.
-- [x] Teste controlado de omissão de ACK.
-- [x] Saída serial estruturada.
-- [x] Coletor Python com pySerial.
-- [x] Primeira coleta CSV com 83 registros.
-- [x] Nova coleta CSV com 199 registros em 09/10/2026.
-- [x] Importação e análise inicial no MATLAB Online.
-- [x] Mínimo, média e máximo de RSSI e SNR.
-- [x] Conferência de sequências distintas, duplicatas e ausências no intervalo observado.
-- [x] Gráficos de RSSI e SNR por sequência.
-- [x] Exportação dos gráficos em PNG e registro no GitHub.
-
-### Próximos passos
-
-- [ ] Criar `pc-analysis/matlab/analise_lora.m` com os comandos já utilizados.
-- [ ] Permitir selecionar diferentes CSVs e gerar um resumo automaticamente.
-- [ ] Analisar duração da coleta e intervalos entre registros.
-- [ ] Definir sessões de teste com início e término controlados.
-- [ ] Medir tempo de ida e volta (RTT).
-- [ ] Integrar resultados do transmissor à análise no computador.
-- [ ] Comparar testes variando distância, obstáculos e parâmetros LoRa.
-- [ ] Documentar resultados dos ensaios controlados.
-- [ ] Avaliar posteriormente uma análise equivalente em Python com `pc-analysis/analyze.py`.
-
-## Marcos do projeto
-
-| Etapa | Situação |
-| --- | --- |
-| STM32 executando Rust e ESP32 executando C/ESP-IDF | Concluída |
-| Comunicação local ESP32 + SX1278 | Concluída em 02/09/2026 |
-| Comunicação local STM32 + SX1278 | Concluída |
-| Primeira comunicação LoRa STM32 → ESP32 | Concluída em 05/09/2026 |
-| Sequências e métricas iniciais | Concluída em 05/09/2026 |
-| ACK, timeout e comunicação bidirecional | Validados em 07/09/2026 |
-| Retransmissões, duplicatas e recuperação | Validadas em 07/09/2026 |
-| Coleta Python e armazenamento CSV | Validados em 07/09/2026 |
-| Análise estatística e gráficos no MATLAB Online | Realizados em 09/10/2026 |
-| Script MATLAB reutilizável | Próxima etapa |
-
-## Estrutura do repositório
-
-| Caminho | Conteúdo |
-| --- | --- |
-| `stm32-blink/stm32-blink/` | Firmware STM32 em Rust |
-| `esp32-hello/` | Exemplo inicial de validação do ESP32 |
-| `esp32-gateway/` | Gateway LoRa com ACK, métricas e saída estruturada |
-| `pc-analysis/collector.py` | Coletor serial |
-| `pc-analysis/requirements.txt` | Dependências Python |
-| `pc-analysis/data/` | Coletas CSV |
-| `pc-analysis/results/20261009/` | Gráficos PNG da sessão de 09/10/2026 |
-| `README.md` | Documentação geral |
-
-A pasta dupla `stm32-blink/stm32-blink/` corresponde à estrutura atual do projeto.
+O resumo e os gráficos são gravados na pasta atual do MATLAB. Para analisar outras sessões, altere os nomes de entrada e de saída no script.
 
 ## Conexões STM32 — SX1278
 
@@ -494,9 +273,9 @@ A pasta dupla `stm32-blink/stm32-blink/` corresponde à estrutura atual do proje
 | RESET | D9 / PC7 |
 | DIO0 | D2 / PA10 |
 
-Foi utilizado um capacitor de **10 µF** entre 3V3 e GND, próximo ao módulo LoRa.
+Foi utilizado um capacitor de **10 µF** entre 3V3 e GND, próximo ao rádio.
 
-> PA5 também está conectado ao LED verde LD2 da Nucleo. Durante a comunicação SPI, é utilizado como SCK.
+PA5 também está conectado ao LED LD2 da Nucleo e é utilizado como SCK neste projeto.
 
 ## Conexões ESP32 — SX1278
 
@@ -511,11 +290,11 @@ Foi utilizado um capacitor de **10 µF** entre 3V3 e GND, próximo ao módulo Lo
 | RESET | GPIO14 |
 | DIO0 | GPIO26 |
 
-## Firmware STM32
+## Compilação e gravação
 
-O firmware utiliza `stm32f4xx-hal 0.23.0`, SPI1, clock interno HSI, temporização via SysTick e logs RTT com `defmt`.
+### STM32 — Rust
 
-No Ubuntu/WSL:
+O firmware utiliza `stm32f4xx-hal 0.23.0`, SPI1, HSI, SysTick e logs RTT com `defmt`.
 
 ```bash
 cd ~/projetos/Projeto-Lora-Stm/stm32-blink/stm32-blink
@@ -523,21 +302,11 @@ cargo build
 cargo run
 ```
 
-A Nucleo deve estar conectada pela USB do ST-LINK e disponibilizada ao WSL. O comando `cargo run` compila, grava e executa o firmware usando `probe-rs`.
+A USB do ST-LINK deve estar disponível no WSL. `cargo run` compila, grava e executa usando `probe-rs`.
 
-| Arquivo | Finalidade |
-| --- | --- |
-| `Cargo.toml` | Dependências e perfis de compilação |
-| `.cargo/config.toml` | Alvo ARM, linker e comando de gravação |
-| `memory.x` | Mapa de memória |
-| `build.rs` | Disponibilização do mapa de memória ao linker |
-| `src/main.rs` | Transmissão, recepção de ACK e reenvios |
+Os logs RTT de depuração são distintos da medição de tempo de ida e volta do enlace, que não foi implementada.
 
-## Firmware ESP32
-
-O projeto utiliza C com ESP-IDF. O rádio permanece em recepção, alterna para transmitir ACKs e retorna à recepção.
-
-No Ubuntu/WSL, em um terminal preparado para ESP-IDF:
+### ESP32 — C/ESP-IDF
 
 ```bash
 cd ~/projetos/Projeto-Lora-Stm/esp32-gateway
@@ -546,29 +315,38 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-Na primeira configuração de uma nova cópia do projeto:
+Na primeira configuração de uma nova cópia:
 
 ```bash
 idf.py set-target esp32
 ```
 
-Para encerrar o monitor serial, pressione **Ctrl + ]**.
+Para sair do monitor: **Ctrl + ]**.
 
-## USB e porta serial no WSL
+### Porta serial no WSL
 
-As placas precisam estar disponibilizadas ao WSL por USB.
-
-O ESP32 utiliza um conversor CP210x na montagem atual. O ST-LINK corresponde à conexão de programação e depuração da STM32.
-
-Se a porta desaparecer após desconectar a placa, verifique o compartilhamento USB e anexe novamente o dispositivo ao WSL.
-
-Se o coletor indicar porta ocupada, verifique:
+Se a porta estiver ocupada:
 
 ```bash
 sudo fuser -v /dev/ttyUSB0
 ```
 
-Encerre o monitor serial ou outro coletor que estiver utilizando a porta antes de iniciar uma nova coleta.
+Encerre o programa que utiliza a serial antes de abrir outro. Após desconectar uma placa, pode ser necessário anexar novamente seu dispositivo USB ao WSL.
+
+## Estrutura do repositório
+
+| Caminho | Conteúdo |
+| --- | --- |
+| `stm32-blink/stm32-blink/` | Firmware STM32 |
+| `esp32-hello/` | Validação inicial do ESP32 |
+| `esp32-gateway/` | Gateway LoRa |
+| `pc-analysis/collector.py` | Coletor serial |
+| `pc-analysis/requirements.txt` | Dependências Python |
+| `pc-analysis/data/` | Coletas CSV |
+| `pc-analysis/matlab/comparar_sessoes.m` | Comparação das sessões finais |
+| `pc-analysis/results/` | Resumos e resultados |
+| `docs/images/` | Gráficos da validação final |
+| `README.md` | Documentação |
 
 ## Ambiente validado
 
@@ -579,39 +357,46 @@ Encerre o monitor serial ou outro coletor que estiver utilizando a porta antes d
 | probe-rs | 0.32.0 |
 | ESP-IDF | 6.0.1 |
 | stm32f4xx-hal | 0.23.0 |
-| Dependências Python | Registradas em `pc-analysis/requirements.txt` |
 
-O desenvolvimento e os testes são realizados no Ubuntu/WSL.
+Desenvolvimento realizado no Ubuntu/WSL. Dependências Python registradas em `requirements.txt`.
 
-Repositório de trabalho:
+Builds, ambientes virtuais e caches permanecem fora do versionamento conforme o `.gitignore`.
 
-```text
-~/projetos/Projeto-Lora-Stm
-```
+## Limitações
 
-As pastas `target/`, `build/` e `managed_components/`, assim como ambientes virtuais e caches, permanecem fora do versionamento conforme o `.gitignore`.
+- Um transmissor e um gateway.
+- Ausência de identificador explícito de sessão.
+- Contadores reiniciam com o respectivo microcontrolador.
+- O gateway usa o retorno à sequência 1 como indício de reinício.
+- O transmissor encerra o ensaio na sequência 99999.
+- Tratamento de duplicatas voltado aos reenvios consecutivos atuais.
+- Lacunas não detectam perdas fora do intervalo recebido.
+- O CSV da base não informa quantos ACKs chegaram à STM32.
+- Timestamps representam processamento no computador.
+- RSSI e SNR são informados pelo firmware, sem calibração independente.
+- O ensaio com posição variável não controla separadamente distância e obstáculos.
+- Não foram implementadas medição de latência/RTT ou integração dos contadores da STM32 ao CSV.
 
-## Aprendizados envolvidos
+## Conclusão
 
-- Rust embarcado e desenvolvimento `no_std`;
-- C com ESP-IDF;
-- GPIO, SPI e temporização;
-- registradores e FIFO do SX1278;
-- eventos `TxDone` e `RxDone`;
-- alternância entre transmissão e recepção;
-- rádio LoRa ponto a ponto;
-- RSSI, SNR e sequências de pacotes;
-- ACK, timeout e retransmissão limitada;
-- tratamento de duplicatas;
-- testes com falhas controladas;
-- depuração de USB e serial no WSL;
-- ambientes virtuais Python;
-- leitura serial, validação de dados e armazenamento CSV;
-- tabelas e acesso a colunas no MATLAB;
-- estatísticas com `mean`, `min` e `max`;
-- contagem de sequências com `unique` e `numel`;
-- gráficos e exportação de figuras;
-- interpretação de métricas dentro do intervalo de observação.
+A versão inicial cumpriu o objetivo de integrar firmware embarcado, comunicação LoRa com confirmação e retransmissão, coleta serial e análise no MATLAB.
+
+Os testes permitiram comparar uma referência próxima com uma sessão de posição variável, identificando diferenças de RSSI, SNR, duplicatas e lacunas de sequência.
+
+Esta etapa do projeto está concluída. Medição de RTT, identificação de sessões, revisão das métricas de RF e ensaios sistemáticos de alcance são possibilidades de evolução.
+
+## Aprendizados
+
+- Rust embarcado e desenvolvimento `no_std`.
+- C com ESP-IDF.
+- GPIO, SPI, temporização e registradores do SX1278.
+- Alternância entre transmissão e recepção.
+- ACK, timeout e retransmissão limitada.
+- Depuração e acesso USB no WSL.
+- Coleta serial e armazenamento CSV em Python.
+- Tabelas, estatísticas, datas e gráficos no MATLAB.
+- Interpretação de resultados e limites de observação.
+- Documentação e versionamento com Git.
 
 ## Autor
 
