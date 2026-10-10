@@ -1,0 +1,3 @@
+Sessao,Recepcoes,PacotesUnicos,Duplicatas,SequenciasAusentes,RecepcaoIntervalo_pct,RSSI_medio_dBm,SNR_medio_dB,DuracaoObservada_s,MaiorIntervaloRecepcoes_s
+Proximo,152,152,0,0,100,-111.506578947368,7.88157894736842,327.679,2.174
+Posicao variavel,153,146,7,18,89.0243902439024,-124.262328767123,-2.53938356164384,546.194,72.537
